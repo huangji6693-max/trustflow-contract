@@ -21,6 +21,12 @@ const MAX_FEE_BPS: u32 = 1_000;
 /// Denominator basis points are expressed against (10_000 bps = 100%).
 const BPS_DENOMINATOR: i128 = 10_000;
 
+/// Initial storage schema version (pre-time-lock milestones and pre-commit-reveal disputes).
+pub const STORAGE_VERSION_V1: u32 = 1;
+
+/// Current storage schema version written on `initialize` and targeted by `migrate`.
+pub const CURRENT_STORAGE_VERSION: u32 = 2;
+
 // ---------------------------------------------------------------------------
 // State archival / TTL bump strategy
 // ---------------------------------------------------------------------------
@@ -237,6 +243,8 @@ pub enum TrustFlowError {
     ContractPaused = 22,
     /// `release_milestone_tranche` called before the milestone's time-lock has expired.
     MilestoneTimeLocked = 23,
+    /// `migrate` called when contract storage is already at `CURRENT_STORAGE_VERSION`.
+    AlreadyAtLatestVersion = 24,
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +374,27 @@ pub struct JurorSlashed {
     pub slash_count: u32,
 }
 
+/// Emitted by [`TrustFlow::upgrade`] when the contract WASM bytecode is updated.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractUpgraded {
+    pub admin: Address,
+    pub new_wasm_hash: BytesN<32>,
+    pub storage_version: u32,
+}
+
+/// Emitted by [`TrustFlow::migrate`] when storage records are migrated to the
+/// current schema version.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StorageMigrated {
+    pub admin: Address,
+    pub from_version: u32,
+    pub to_version: u32,
+    pub escrows_migrated: u32,
+    pub disputes_migrated: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Storage types
 // ---------------------------------------------------------------------------
@@ -441,6 +470,12 @@ pub enum DataKey {
     Paused,
     /// Granular role: address authorized to trigger emergency pause (Address)
     Pauser,
+    /// Explicit storage-layout schema version (u32)
+    StorageVersion,
+    /// Legacy v1 EscrowRecord keyed by escrow ID prior to migration
+    LegacyEscrowV1(u64),
+    /// Legacy v1 DisputeRecord keyed by escrow ID prior to migration
+    LegacyDisputeV1(u64),
 }
 
 /// Helper function that returns `Err(TrustFlowError::ContractPaused)` if the
@@ -477,6 +512,39 @@ pub struct Milestone {
     pub amount: i128,
     pub approved: bool,
     pub release_time: u32,
+}
+
+/// Legacy v1 milestone layout (prior to the `release_time` field).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneV1 {
+    pub label: String,
+    pub amount: i128,
+    pub approved: bool,
+}
+
+/// Legacy v1 escrow layout transformed by [`TrustFlow::migrate`] into [`EscrowRecord`].
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowRecordV1 {
+    pub id: u64,
+    pub depositor: Address,
+    pub beneficiary: Address,
+    pub amount: i128,
+    pub status: EscrowStatus,
+    pub milestones: Vec<MilestoneV1>,
+}
+
+/// Legacy v1 dispute layout (prior to commit/reveal window deadlines)
+/// transformed by [`TrustFlow::migrate`] into [`DisputeRecord`].
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DisputeRecordV1 {
+    pub escrow_id: u64,
+    pub raised_by: Address,
+    pub reason: String,
+    pub resolved: bool,
+    pub ruling_for_depositor: bool,
 }
 
 #[contracttype]
@@ -545,7 +613,200 @@ impl TrustFlow {
             .instance()
             .set(&DataKey::FeeBps, &DEFAULT_FEE_BPS);
         env.storage().instance().set(&DataKey::Treasury, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::StorageVersion, &CURRENT_STORAGE_VERSION);
         extend_instance_ttl(&env);
+    }
+
+    // -----------------------------------------------------------------------
+    // Upgradeability & Storage-Layout Migration (#41)
+    // -----------------------------------------------------------------------
+
+    /// Return the current on-chain storage schema version (`0` for legacy
+    /// unversioned deployments, `CURRENT_STORAGE_VERSION` for initialized or
+    /// migrated instances).
+    pub fn get_storage_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::StorageVersion)
+            .unwrap_or(0)
+    }
+
+    /// Admin-only: upgrade the contract's WASM bytecode in place to
+    /// `new_wasm_hash` and emit a [`ContractUpgraded`] indexing event.
+    pub fn upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+
+        let storage_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StorageVersion)
+            .unwrap_or(0);
+        env.events().publish(
+            (symbol_short!("contract"), symbol_short!("upgraded")),
+            ContractUpgraded {
+                admin: caller,
+                new_wasm_hash,
+                storage_version,
+            },
+        );
+        Ok(())
+    }
+
+    /// Admin-only: migrate existing contract storage from legacy versions
+    /// (`0` or [`STORAGE_VERSION_V1`]) to [`CURRENT_STORAGE_VERSION`].
+    ///
+    /// Safely transforms:
+    /// - Missing instance-level `FeeBps` and `Treasury` defaults
+    /// - Any [`DataKey::LegacyEscrowV1`] records into v2 [`EscrowRecord`]
+    ///   entries (populating `release_time: 0` on each milestone)
+    /// - Missing [`DataKey::EscrowFeeConfig`] snapshots on existing escrows
+    /// - Any [`DataKey::LegacyDisputeV1`] records into v2 [`DisputeRecord`]
+    ///   entries (populating `commit_deadline` and `reveal_deadline`)
+    pub fn migrate(env: Env, caller: Address) -> Result<u32, TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+
+        let from_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StorageVersion)
+            .unwrap_or(0);
+        if from_version >= CURRENT_STORAGE_VERSION {
+            return Err(TrustFlowError::AlreadyAtLatestVersion);
+        }
+
+        if !env.storage().instance().has(&DataKey::FeeBps) {
+            env.storage()
+                .instance()
+                .set(&DataKey::FeeBps, &DEFAULT_FEE_BPS);
+        }
+        if !env.storage().instance().has(&DataKey::Treasury) {
+            env.storage().instance().set(&DataKey::Treasury, &admin);
+        }
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowCounter)
+            .unwrap_or(0);
+        let now = env.ledger().sequence();
+        let mut escrows_migrated: u32 = 0;
+        let mut disputes_migrated: u32 = 0;
+
+        let mut escrow_id: u64 = 1;
+        while escrow_id <= count {
+            let mut touched_escrow = false;
+            let legacy_escrow_key = DataKey::LegacyEscrowV1(escrow_id);
+            let escrow_key = DataKey::Escrow(escrow_id);
+
+            if let Some(legacy) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, EscrowRecordV1>(&legacy_escrow_key)
+            {
+                let mut v2_milestones: Vec<Milestone> = Vec::new(&env);
+                for m in legacy.milestones.iter() {
+                    v2_milestones.push_back(Milestone {
+                        label: m.label,
+                        amount: m.amount,
+                        approved: m.approved,
+                        release_time: 0,
+                    });
+                }
+                let migrated_escrow = EscrowRecord {
+                    id: legacy.id,
+                    depositor: legacy.depositor,
+                    beneficiary: legacy.beneficiary,
+                    amount: legacy.amount,
+                    status: legacy.status,
+                    milestones: v2_milestones,
+                };
+                env.storage()
+                    .persistent()
+                    .set(&escrow_key, &migrated_escrow);
+                extend_persistent_ttl(&env, &escrow_key);
+                env.storage().persistent().remove(&legacy_escrow_key);
+                touched_escrow = true;
+            }
+
+            if env.storage().persistent().has(&escrow_key)
+                && !env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::EscrowFeeConfig(escrow_id))
+            {
+                snapshot_fee_config(&env, escrow_id);
+                extend_persistent_ttl(&env, &escrow_key);
+                touched_escrow = true;
+            }
+
+            if touched_escrow {
+                escrows_migrated = escrows_migrated.saturating_add(1);
+            }
+
+            let legacy_dispute_key = DataKey::LegacyDisputeV1(escrow_id);
+            let dispute_key = DataKey::Dispute(escrow_id);
+            if let Some(legacy_dispute) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, DisputeRecordV1>(&legacy_dispute_key)
+            {
+                let commit_deadline = now.saturating_add(COMMIT_WINDOW_LEDGERS);
+                let reveal_deadline = commit_deadline.saturating_add(REVEAL_WINDOW_LEDGERS);
+                let migrated_dispute = DisputeRecord {
+                    escrow_id: legacy_dispute.escrow_id,
+                    raised_by: legacy_dispute.raised_by,
+                    reason: legacy_dispute.reason,
+                    resolved: legacy_dispute.resolved,
+                    ruling_for_depositor: legacy_dispute.ruling_for_depositor,
+                    commit_deadline,
+                    reveal_deadline,
+                };
+                env.storage()
+                    .persistent()
+                    .set(&dispute_key, &migrated_dispute);
+                extend_persistent_ttl(&env, &dispute_key);
+                env.storage().persistent().remove(&legacy_dispute_key);
+                disputes_migrated = disputes_migrated.saturating_add(1);
+            }
+
+            escrow_id += 1;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::StorageVersion, &CURRENT_STORAGE_VERSION);
+
+        env.events().publish(
+            (symbol_short!("storage"), symbol_short!("migrated")),
+            StorageMigrated {
+                admin: caller,
+                from_version,
+                to_version: CURRENT_STORAGE_VERSION,
+                escrows_migrated,
+                disputes_migrated,
+            },
+        );
+
+        Ok(CURRENT_STORAGE_VERSION)
     }
 
     /// Admin-only: update the global default protocol fee (bps) used to
@@ -3866,5 +4127,158 @@ mod tests {
         client.release_milestone_tranche(&escrow_id, &0u32, &50_000, &depositor);
 
         assert_eq!(balance(&env, &token_addr, &beneficiary), 49_750);
+    }
+
+    // -----------------------------------------------------------------------
+    // Upgradeable Contract & Storage-Layout Versioning/Migration Tests (#41)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_initialize_sets_current_storage_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, _sac) = setup(&env, DEFAULT_SLASH_BPS);
+        assert_eq!(client.get_storage_version(), CURRENT_STORAGE_VERSION);
+    }
+
+    #[test]
+    fn test_upgrade_rejects_unauthorized_caller() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, _sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let outsider = Address::random(&env);
+        let dummy_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        let result = client.try_upgrade(&outsider, &dummy_hash);
+        assert_eq!(result, Err(Ok(TrustFlowError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_migrate_rejects_unauthorized_and_already_at_latest_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, _sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let admin = client.get_treasury();
+        let outsider = Address::random(&env);
+
+        assert_eq!(
+            client.try_migrate(&outsider),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+
+        assert_eq!(
+            client.try_migrate(&admin),
+            Err(Ok(TrustFlowError::AlreadyAtLatestVersion))
+        );
+    }
+
+    #[test]
+    fn test_migrate_transforms_v1_escrow_and_dispute_state_to_v2() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let admin = client.get_treasury();
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+
+        // Fund the contract as if a legacy v1 escrow of 10_000 tokens is locked
+        mint(&sac, &client.address, 10_000);
+
+        // Seed legacy v1 state inside contract storage
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::StorageVersion, &STORAGE_VERSION_V1);
+            env.storage().instance().remove(&DataKey::FeeBps);
+            env.storage().instance().remove(&DataKey::Treasury);
+            env.storage().instance().set(&DataKey::EscrowCounter, &1u64);
+
+            let legacy_milestones = Vec::from_array(
+                &env,
+                [
+                    MilestoneV1 {
+                        label: String::from_slice(&env, "Phase 1"),
+                        amount: 4_000,
+                        approved: false,
+                    },
+                    MilestoneV1 {
+                        label: String::from_slice(&env, "Phase 2"),
+                        amount: 6_000,
+                        approved: false,
+                    },
+                ],
+            );
+
+            env.storage().persistent().set(
+                &DataKey::LegacyEscrowV1(1),
+                &EscrowRecordV1 {
+                    id: 1,
+                    depositor: depositor.clone(),
+                    beneficiary: beneficiary.clone(),
+                    amount: 10_000,
+                    status: EscrowStatus::Active,
+                    milestones: legacy_milestones,
+                },
+            );
+
+            env.storage().persistent().set(
+                &DataKey::LegacyDisputeV1(1),
+                &DisputeRecordV1 {
+                    escrow_id: 1,
+                    raised_by: depositor.clone(),
+                    reason: String::from_slice(&env, "legacy dispute"),
+                    resolved: false,
+                    ruling_for_depositor: false,
+                },
+            );
+        });
+
+        assert_eq!(client.get_storage_version(), STORAGE_VERSION_V1);
+
+        let migrated_to = client.migrate(&admin);
+        assert_eq!(migrated_to, CURRENT_STORAGE_VERSION);
+        assert_eq!(client.get_storage_version(), CURRENT_STORAGE_VERSION);
+        assert_eq!(client.get_fee_bps(), DEFAULT_FEE_BPS);
+        assert_eq!(client.get_treasury(), admin);
+
+        // VerifyStorageMigrated event
+        let (event_contract, event_topics, event_data) = env.events().all().last().unwrap();
+        assert_eq!(event_contract, client.address);
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+            (symbol_short!("storage"), symbol_short!("migrated")).into_val(&env);
+        assert_eq!(event_topics, expected_topics);
+        let decoded = StorageMigrated::try_from_val(&env, &event_data).unwrap();
+        assert_eq!(decoded.from_version, STORAGE_VERSION_V1);
+        assert_eq!(decoded.to_version, CURRENT_STORAGE_VERSION);
+        assert_eq!(decoded.escrows_migrated, 1);
+        assert_eq!(decoded.disputes_migrated, 1);
+
+        // Verify v2 EscrowRecord & DisputeRecord are populated and legacy keys removed
+        let escrow = read_escrow(&env, &client.address, 1);
+        assert_eq!(escrow.amount, 10_000);
+        assert_eq!(escrow.milestones.len(), 2);
+        assert_eq!(escrow.milestones.get(0).unwrap().release_time, 0);
+        assert_eq!(escrow.milestones.get(1).unwrap().release_time, 0);
+
+        let fee_cfg = read_escrow_fee_config(&env, &client.address, 1);
+        assert_eq!(fee_cfg.fee_bps, DEFAULT_FEE_BPS);
+        assert_eq!(fee_cfg.treasury, admin);
+
+        let dispute = read_dispute(&env, &client.address, 1);
+        assert_eq!(dispute.commit_deadline, COMMIT_WINDOW_LEDGERS);
+        assert_eq!(
+            dispute.reveal_deadline,
+            COMMIT_WINDOW_LEDGERS + REVEAL_WINDOW_LEDGERS
+        );
+
+        let legacy_gone = env.as_contract(&client.address, || {
+            !env.storage().persistent().has(&DataKey::LegacyEscrowV1(1))
+                && !env.storage().persistent().has(&DataKey::LegacyDisputeV1(1))
+        });
+        assert!(legacy_gone);
+
+        // Verify the migrated escrow works seamlessly with v2 milestone release
+        client.release_milestone_tranche(&1u64, &0u32, &4_000, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 3_980);
     }
 }
