@@ -13,9 +13,23 @@ pub fn release_to_beneficiary(env: &Env, escrow_id: u64) -> Result<i128, TrustFl
     let fee_bps: u32 = env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(50);
     let fee = escrow.amount * fee_bps as i128 / 10_000;
     let payout = escrow.amount - fee;
-    let token_client = token::Client::new(env, &escrow.token);
-    token_client.transfer(&env.current_contract_address(), &escrow.beneficiary, &payout);
+    let locked: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::ReentrancyGuard)
+        .unwrap_or(false);
+    if locked {
+        return Err(TrustFlowError::ReentrancyDetected);
+    }
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyGuard, &true);
     escrow.status = EscrowStatus::Released;
     env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+    let token_client = token::Client::new(env, &escrow.token);
+    token_client.transfer(&env.current_contract_address(), &escrow.beneficiary, &payout);
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyGuard, &false);
     Ok(payout)
 }

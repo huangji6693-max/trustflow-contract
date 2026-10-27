@@ -22,6 +22,8 @@ pub enum DataKey {
     OracleAddress,
     /// Whether the contract is paused (emergency stop)
     Paused,
+    /// Re-entrancy guard lock flag for cross-contract token calls
+    ReentrancyGuard,
 }
 
 /// Number of ledgers to extend persistent storage TTL (time-to-live)

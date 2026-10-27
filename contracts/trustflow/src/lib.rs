@@ -178,6 +178,37 @@ fn snapshot_fee_config(env: &Env, escrow_id: u64) {
     extend_persistent_ttl(env, &fee_config_key);
 }
 
+fn enter_reentrancy_guard(env: &Env) -> Result<(), TrustFlowError> {
+    let locked: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::ReentrancyGuard)
+        .unwrap_or(false);
+    if locked {
+        return Err(TrustFlowError::ReentrancyDetected);
+    }
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyGuard, &true);
+    Ok(())
+}
+
+fn exit_reentrancy_guard(env: &Env) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyGuard, &false);
+}
+
+fn with_reentrancy_guard<T, F>(env: &Env, f: F) -> Result<T, TrustFlowError>
+where
+    F: FnOnce() -> Result<T, TrustFlowError>,
+{
+    enter_reentrancy_guard(env)?;
+    let res = f();
+    exit_reentrancy_guard(env);
+    res
+}
+
 fn try_token_transfer(
     env: &Env,
     token_address: &Address,
@@ -237,6 +268,8 @@ pub enum TrustFlowError {
     ContractPaused = 22,
     /// `release_milestone_tranche` called before the milestone's time-lock has expired.
     MilestoneTimeLocked = 23,
+    /// Returned when a cross-contract call attempts to re-enter a guarded entrypoint.
+    ReentrancyDetected = 24,
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +474,8 @@ pub enum DataKey {
     Paused,
     /// Granular role: address authorized to trigger emergency pause (Address)
     Pauser,
+    /// Re-entrancy guard lock flag for cross-contract token calls (bool)
+    ReentrancyGuard,
 }
 
 /// Helper function that returns `Err(TrustFlowError::ContractPaused)` if the
@@ -721,27 +756,33 @@ impl TrustFlow {
         if amount <= 0 {
             return Err(TrustFlowError::InvalidAmount);
         }
-        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        token::Client::new(&env, &token).transfer(&juror, &env.current_contract_address(), &amount);
+        with_reentrancy_guard(&env, || {
+            let key = DataKey::JurorStake(juror.clone());
+            let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            let new_total = prev
+                .checked_add(amount)
+                .ok_or(TrustFlowError::ArithmeticOverflow)?;
+            env.storage().persistent().set(&key, &new_total);
+            extend_persistent_ttl(&env, &key);
 
-        let key = DataKey::JurorStake(juror.clone());
-        let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_total = prev
-            .checked_add(amount)
-            .ok_or(TrustFlowError::ArithmeticOverflow)?;
-        env.storage().persistent().set(&key, &new_total);
-        extend_persistent_ttl(&env, &key);
+            let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+            token::Client::new(&env, &token).transfer(
+                &juror,
+                &env.current_contract_address(),
+                &amount,
+            );
 
-        env.events().publish(
-            (symbol_short!("stake"), symbol_short!("staked")),
-            Staked {
-                juror,
-                amount,
-                new_total,
-            },
-        );
+            env.events().publish(
+                (symbol_short!("stake"), symbol_short!("staked")),
+                Staked {
+                    juror,
+                    amount,
+                    new_total,
+                },
+            );
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Withdraw `amount` tokens that have not been slashed.
@@ -749,29 +790,36 @@ impl TrustFlow {
         juror.require_auth();
         extend_instance_ttl(&env);
         require_not_paused(&env)?;
-        let key = DataKey::JurorStake(juror.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        if current < amount {
-            return Err(TrustFlowError::InsufficientStake);
-        }
-        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &juror, &amount);
-        let remaining = current
-            .checked_sub(amount)
-            .ok_or(TrustFlowError::ArithmeticOverflow)?;
-        env.storage().persistent().set(&key, &remaining);
-        extend_persistent_ttl(&env, &key);
+        with_reentrancy_guard(&env, || {
+            let key = DataKey::JurorStake(juror.clone());
+            let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            if current < amount {
+                return Err(TrustFlowError::InsufficientStake);
+            }
+            let remaining = current
+                .checked_sub(amount)
+                .ok_or(TrustFlowError::ArithmeticOverflow)?;
+            env.storage().persistent().set(&key, &remaining);
+            extend_persistent_ttl(&env, &key);
 
-        env.events().publish(
-            (symbol_short!("stake"), symbol_short!("unstaked")),
-            Unstaked {
-                juror,
-                amount,
-                remaining,
-            },
-        );
+            let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &juror,
+                &amount,
+            );
 
-        Ok(())
+            env.events().publish(
+                (symbol_short!("stake"), symbol_short!("unstaked")),
+                Unstaked {
+                    juror,
+                    amount,
+                    remaining,
+                },
+            );
+
+            Ok(())
+        })
     }
 
     /// Return the current staked balance for `juror`.
@@ -840,38 +888,41 @@ impl TrustFlow {
         if amount <= 0 {
             return Err(TrustFlowError::InvalidAmount);
         }
-        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        token::Client::new(&env, &token).transfer(
-            &depositor,
-            &env.current_contract_address(),
-            &amount,
-        );
+        with_reentrancy_guard(&env, || {
+            let counter: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::EscrowCounter)
+                .unwrap_or(0);
+            let id = counter
+                .checked_add(1)
+                .ok_or(TrustFlowError::ArithmeticOverflow)?;
+            env.storage().instance().set(&DataKey::EscrowCounter, &id);
 
-        let counter: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::EscrowCounter)
-            .unwrap_or(0);
-        let id = counter
-            .checked_add(1)
-            .ok_or(TrustFlowError::ArithmeticOverflow)?;
-        env.storage().instance().set(&DataKey::EscrowCounter, &id);
+            let escrow_key = DataKey::Escrow(id);
+            env.storage().persistent().set(
+                &escrow_key,
+                &EscrowRecord {
+                    id,
+                    depositor: depositor.clone(),
+                    beneficiary,
+                    amount,
+                    status: EscrowStatus::Active,
+                    milestones: Vec::new(&env),
+                },
+            );
+            extend_persistent_ttl(&env, &escrow_key);
+            snapshot_fee_config(&env, id);
 
-        let escrow_key = DataKey::Escrow(id);
-        env.storage().persistent().set(
-            &escrow_key,
-            &EscrowRecord {
-                id,
-                depositor,
-                beneficiary,
-                amount,
-                status: EscrowStatus::Active,
-                milestones: Vec::new(&env),
-            },
-        );
-        extend_persistent_ttl(&env, &escrow_key);
-        snapshot_fee_config(&env, id);
-        Ok(id)
+            let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+            token::Client::new(&env, &token).transfer(
+                &depositor,
+                &env.current_contract_address(),
+                &amount,
+            );
+
+            Ok(id)
+        })
     }
 
     /// Initialise an escrow with specific milestones and lock `amount` tokens.
@@ -899,49 +950,51 @@ impl TrustFlow {
             return Err(TrustFlowError::InvalidAmount);
         }
 
-        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        token::Client::new(&env, &token).transfer(
-            &depositor,
-            &env.current_contract_address(),
-            &total_amount,
-        );
+        with_reentrancy_guard(&env, || {
+            let counter: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::EscrowCounter)
+                .unwrap_or(0);
+            let id = counter
+                .checked_add(1)
+                .ok_or(TrustFlowError::ArithmeticOverflow)?;
+            env.storage().instance().set(&DataKey::EscrowCounter, &id);
 
-        let counter: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::EscrowCounter)
-            .unwrap_or(0);
-        let id = counter
-            .checked_add(1)
-            .ok_or(TrustFlowError::ArithmeticOverflow)?;
-        env.storage().instance().set(&DataKey::EscrowCounter, &id);
+            let escrow_key = DataKey::Escrow(id);
+            env.storage().persistent().set(
+                &escrow_key,
+                &EscrowRecord {
+                    id,
+                    depositor: depositor.clone(),
+                    beneficiary: beneficiary.clone(),
+                    amount: total_amount,
+                    status: EscrowStatus::Active,
+                    milestones,
+                },
+            );
+            extend_persistent_ttl(&env, &escrow_key);
+            snapshot_fee_config(&env, id);
 
-        let escrow_key = DataKey::Escrow(id);
-        env.storage().persistent().set(
-            &escrow_key,
-            &EscrowRecord {
-                id,
-                depositor: depositor.clone(),
-                beneficiary: beneficiary.clone(),
-                amount: total_amount,
-                status: EscrowStatus::Active,
-                milestones,
-            },
-        );
-        extend_persistent_ttl(&env, &escrow_key);
-        snapshot_fee_config(&env, id);
+            let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+            token::Client::new(&env, &token).transfer(
+                &depositor,
+                &env.current_contract_address(),
+                &total_amount,
+            );
 
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("init")),
-            EscrowInitialized {
-                escrow_id: id,
-                depositor,
-                beneficiary,
-                amount: total_amount,
-            },
-        );
+            env.events().publish(
+                (symbol_short!("escrow"), symbol_short!("init")),
+                EscrowInitialized {
+                    escrow_id: id,
+                    depositor,
+                    beneficiary,
+                    amount: total_amount,
+                },
+            );
 
-        Ok(id)
+            Ok(id)
+        })
     }
 
     /// Release a `gross_amount` tranche of a milestone to its beneficiary,
@@ -1056,24 +1109,23 @@ impl TrustFlow {
             .set(&released_key, &escrow_released_after);
         extend_persistent_ttl(&env, &released_key);
 
-        // -- Accounting is durable; now move the tokens. --
+        // -- Accounting is durable; now move the tokens under the reentrancy guard. --
 
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let contract_address = env.current_contract_address();
-        try_token_transfer(
-            &env,
-            &token,
-            &contract_address,
-            &escrow.beneficiary,
-            beneficiary_payout,
-        )?;
-        try_token_transfer(
-            &env,
-            &token,
-            &contract_address,
-            &fee_config.treasury,
-            treasury_fee,
-        )?;
+        let beneficiary = escrow.beneficiary.clone();
+        let treasury = fee_config.treasury.clone();
+        with_reentrancy_guard(&env, || {
+            try_token_transfer(
+                &env,
+                &token,
+                &contract_address,
+                &beneficiary,
+                beneficiary_payout,
+            )?;
+            try_token_transfer(&env, &token, &contract_address, &treasury, treasury_fee)?;
+            Ok(())
+        })?;
 
         env.events().publish(
             (
@@ -1502,13 +1554,17 @@ impl TrustFlow {
         } else {
             escrow.beneficiary.clone()
         };
-        if remaining > 0 {
-            token_client.transfer(&env.current_contract_address(), &recipient, &remaining);
-        }
 
         escrow.status = EscrowStatus::Settled;
         env.storage().persistent().set(&escrow_key, &escrow);
         extend_persistent_ttl(&env, &escrow_key);
+
+        if remaining > 0 {
+            with_reentrancy_guard(&env, || {
+                token_client.transfer(&env.current_contract_address(), &recipient, &remaining);
+                Ok(())
+            })?;
+        }
 
         Ok(ruling)
     }
@@ -3866,5 +3922,134 @@ mod tests {
         client.release_milestone_tranche(&escrow_id, &0u32, &50_000, &depositor);
 
         assert_eq!(balance(&env, &token_addr, &beneficiary), 49_750);
+    }
+
+    #[contract]
+    pub struct ReentrantToken;
+
+    #[contracttype]
+    pub enum ReentrantTokenKey {
+        TargetContract,
+        TargetEscrowId,
+        TargetDepositor,
+        ReenterOnTransfer,
+        LastReentryError,
+    }
+
+    #[contractimpl]
+    impl ReentrantToken {
+        pub fn configure(
+            env: Env,
+            target_contract: Address,
+            escrow_id: u64,
+            depositor: Address,
+            reenter: bool,
+        ) {
+            env.storage()
+                .instance()
+                .set(&ReentrantTokenKey::TargetContract, &target_contract);
+            env.storage()
+                .instance()
+                .set(&ReentrantTokenKey::TargetEscrowId, &escrow_id);
+            env.storage()
+                .instance()
+                .set(&ReentrantTokenKey::TargetDepositor, &depositor);
+            env.storage()
+                .instance()
+                .set(&ReentrantTokenKey::ReenterOnTransfer, &reenter);
+        }
+
+        pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
+            let reenter: bool = env
+                .storage()
+                .instance()
+                .get(&ReentrantTokenKey::ReenterOnTransfer)
+                .unwrap_or(false);
+            if reenter {
+                env.storage()
+                    .instance()
+                    .set(&ReentrantTokenKey::ReenterOnTransfer, &false);
+                let target: Address = env
+                    .storage()
+                    .instance()
+                    .get(&ReentrantTokenKey::TargetContract)
+                    .unwrap();
+                let escrow_id: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&ReentrantTokenKey::TargetEscrowId)
+                    .unwrap();
+                let depositor: Address = env
+                    .storage()
+                    .instance()
+                    .get(&ReentrantTokenKey::TargetDepositor)
+                    .unwrap();
+                let tf_client = TrustFlowClient::new(&env, &target);
+                let res =
+                    tf_client.try_release_milestone_tranche(&escrow_id, &0u32, &100, &depositor);
+                let blocked = res.is_err();
+                env.storage()
+                    .instance()
+                    .set(&ReentrantTokenKey::LastReentryError, &blocked);
+            }
+        }
+
+        pub fn was_reentry_blocked(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&ReentrantTokenKey::LastReentryError)
+                .unwrap_or(false)
+        }
+    }
+
+    #[test]
+    fn test_reentrancy_guard_blocks_malicious_token_callback() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::random(&env);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+
+        let mal_token_id = env.register_contract(None, ReentrantToken);
+        let mal_token = ReentrantTokenClient::new(&env, &mal_token_id);
+
+        let contract_id = env.register_contract(None, TrustFlow);
+        let client = TrustFlowClient::new(&env, &contract_id);
+        client.initialize(&admin, &mal_token_id, &DEFAULT_SLASH_BPS);
+
+        // Verify nested with_reentrancy_guard directly rejects re-entry with ReentrancyDetected
+        env.as_contract(&contract_id, || {
+            let nested = with_reentrancy_guard(&env, || with_reentrancy_guard(&env, || Ok(())));
+            assert_eq!(nested, Err(TrustFlowError::ReentrancyDetected));
+            // Guard is unlocked after outer closure exits
+            let locked: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::ReentrancyGuard)
+                .unwrap_or(false);
+            assert!(!locked);
+        });
+
+        let milestones = soroban_sdk::vec![
+            &env,
+            Milestone {
+                label: String::from_slice(&env, "M1"),
+                amount: 1_000,
+                approved: false,
+                release_time: 0,
+            }
+        ];
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Configure malicious token to attempt re-entering release_milestone_tranche during transfer
+        mal_token.configure(&contract_id, &escrow_id, &depositor, &true);
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+
+        // Re-entry during transfer must have been rejected
+        assert!(mal_token.was_reentry_blocked());
+        // Only the outer 500 tranche was released; the re-entrant 100 call did not execute
+        assert_eq!(read_escrow_released(&env, &contract_id, escrow_id), 500);
     }
 }

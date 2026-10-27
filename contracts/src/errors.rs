@@ -14,4 +14,5 @@ pub enum TrustFlowError {
     OracleStale = 8,
     ArithmeticOverflow = 9,
     InvalidState = 10,
+    ReentrancyDetected = 11,
 }
